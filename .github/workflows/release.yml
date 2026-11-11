@@ -1,0 +1,187 @@
+name: Release
+
+# Pushing a version tag (1.2.3 or v1.2.3, matching Cargo.toml) runs the tests,
+# builds every target, and publishes a GitHub release with the archives.
+# Running it by hand builds everything without publishing.
+on:
+  push:
+    tags:
+      - 'v?[0-9]+.[0-9]+.[0-9]+'
+      - 'v?[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - id: version
+        name: Read the version and match it against the tag
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ $GITHUB_REF == refs/tags/* && ${GITHUB_REF_NAME#v} != "$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
+            exit 1
+          fi
+
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: [version, ci]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04, zig: true }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, zig: true }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04, zig: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, zig: true }
+          - { target: x86_64-apple-darwin, os: macos-15-intel }
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          - { target: x86_64-pc-windows-msvc, os: windows-2025 }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      TARGET: ${{ matrix.target }}
+      NAME: ssh-config-compact-${{ needs.version.outputs.version }}-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: matrix.zig
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - if: matrix.zig
+        name: Install cargo-zigbuild
+        run: python -m pip install cargo-zigbuild==0.24.1 ziglang==0.17.1
+      - name: Build
+        shell: bash
+        run: |
+          case $TARGET in
+            # glibc 2.17 is the oldest that Rust supports, so the binary runs
+            # on every glibc-based distribution of the last decade.
+            *-linux-gnu) cargo zigbuild --release --locked --target "$TARGET.2.17" ;;
+            *-linux-musl) cargo zigbuild --release --locked --target "$TARGET" ;;
+            *) cargo build --release --locked --target "$TARGET" ;;
+          esac
+      - name: Smoke test
+        shell: bash
+        run: |
+          bin=target/$TARGET/release/ssh-config-compact
+          if [[ $RUNNER_OS == Windows ]]; then bin=$bin.exe; fi
+          file "$bin" || true
+          if [[ $TARGET == *-linux-gnu ]]; then
+            echo "needs $(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+          fi
+          "$bin" --version
+          dir=$(mktemp -d)
+          printf 'Host demo\n\tUser=me\n' > "$dir/config"
+          "$bin" --config "$dir/config" --format-only --apply --yes
+          test "$(cat "$dir/config")" = "$(printf 'Host demo\n  User me')"
+          ls "$dir"/config.bak.*
+      - name: Package (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p "dist/$NAME"
+          cp "target/$TARGET/release/ssh-config-compact" README.md LICENSE "dist/$NAME/"
+          flags=()
+          if [[ $RUNNER_OS == macOS ]]; then flags=(--no-mac-metadata); fi
+          tar "${flags[@]}" -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          rm -r "dist/$NAME"
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "dist/$env:NAME" | Out-Null
+          Copy-Item "target/$env:TARGET/release/ssh-config-compact.exe", README.md, LICENSE "dist/$env:NAME/"
+          # The bsdtar that ships with Windows writes a standard zip file.
+          tar.exe -a -c -f "dist/$env:NAME.zip" -C dist "$env:NAME"
+          Remove-Item -Recurse "dist/$env:NAME"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [version, build]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Release notes
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          # This version's section of CHANGELOG.md, then what to download.
+          awk -v version="$VERSION" '/^## / { section = ($2 == version); next } section' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no section for $VERSION"
+            exit 1
+          fi
+          cat >> notes.md <<EOF
+
+          ## Downloads
+
+          | Platform | Archive |
+          | --- | --- |
+          | Linux x86_64 (glibc 2.17+) | \`ssh-config-compact-$VERSION-x86_64-unknown-linux-gnu.tar.gz\` |
+          | Linux ARM64 (glibc 2.17+) | \`ssh-config-compact-$VERSION-aarch64-unknown-linux-gnu.tar.gz\` |
+          | Linux x86_64 (static, musl) | \`ssh-config-compact-$VERSION-x86_64-unknown-linux-musl.tar.gz\` |
+          | Linux ARM64 (static, musl) | \`ssh-config-compact-$VERSION-aarch64-unknown-linux-musl.tar.gz\` |
+          | macOS Apple silicon | \`ssh-config-compact-$VERSION-aarch64-apple-darwin.tar.gz\` |
+          | macOS Intel | \`ssh-config-compact-$VERSION-x86_64-apple-darwin.tar.gz\` |
+          | Windows x64 | \`ssh-config-compact-$VERSION-x86_64-pc-windows-msvc.zip\` |
+          | Windows ARM64 | \`ssh-config-compact-$VERSION-aarch64-pc-windows-msvc.zip\` |
+
+          Each archive holds the \`ssh-config-compact\` executable, README.md, and LICENSE.
+          Prefer the glibc builds on Linux; the static musl builds are for systems without glibc,
+          such as Alpine, and look up accounts and host names without NSS modules.
+          The OpenSSH client (\`ssh\`) must be installed; on Windows, that is the built-in OpenSSH Client.
+          Verify a download with \`sha256sum --check --ignore-missing SHA256SUMS\`.
+          EOF
+          cat notes.md
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          flags=()
+          if [[ $TAG == *-* ]]; then flags=(--prerelease); fi
+          gh release create "$TAG" dist/* --verify-tag --title "$TAG" --notes-file notes.md "${flags[@]}"

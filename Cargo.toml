@@ -1,8 +1,14 @@
 [package]
 name = "ssh-config-compact"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Clean up, merge, or format SSH config with confirmation and backups"
+license = "BSD-2-Clause"
+repository = "https://github.com/weongyo/ssh-config-compact"
+readme = "README.md"
+keywords = ["ssh", "ssh-config", "openssh", "cli"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0"
@@ -26,3 +32,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Time",
     "Win32_UI_Shell",
 ] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true

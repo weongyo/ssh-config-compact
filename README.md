@@ -5,10 +5,42 @@ By default it only shows the candidates. **Removal always requires user confirma
 
 ## Installation
 
-Requires Rust/Cargo and the OpenSSH `ssh` command. Linux and macOS are supported.
+Linux, macOS, and Windows are supported. The tool runs the OpenSSH client (`ssh`), so it must be installed;
+on Windows, that is the built-in OpenSSH Client (Settings > System > Optional features).
 `--format-only` without `--sort` works even without the `ssh` command.
 
+### Prebuilt binaries
+
+Download the archive for your platform from the [latest release](https://github.com/weongyo/ssh-config-compact/releases/latest),
+check it against `SHA256SUMS`, and put the executable in a directory on your `PATH`.
+
+| Platform | Archive `ssh-config-compact-<version>-...` |
+|---|---|
+| Linux x86_64 / ARM64 (glibc 2.17 or later) | `x86_64-unknown-linux-gnu.tar.gz` / `aarch64-unknown-linux-gnu.tar.gz` |
+| Linux x86_64 / ARM64, static | `x86_64-unknown-linux-musl.tar.gz` / `aarch64-unknown-linux-musl.tar.gz` |
+| macOS Intel / Apple silicon | `x86_64-apple-darwin.tar.gz` / `aarch64-apple-darwin.tar.gz` |
+| Windows x64 / ARM64 | `x86_64-pc-windows-msvc.zip` / `aarch64-pc-windows-msvc.zip` |
+
 ```sh
+version=1.0.0 target=x86_64-unknown-linux-gnu
+base=https://github.com/weongyo/ssh-config-compact/releases/download/$version
+curl -LO "$base/ssh-config-compact-$version-$target.tar.gz" -LO "$base/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS   # macOS: shasum -a 256 --check --ignore-missing SHA256SUMS
+tar xzf "ssh-config-compact-$version-$target.tar.gz"
+install -m 755 "ssh-config-compact-$version-$target/ssh-config-compact" ~/.local/bin/
+```
+
+Prefer the glibc builds on Linux. The static (musl) builds are for systems without glibc, such as Alpine:
+they find your account only in `/etc/passwd` and resolve names only through `/etc/hosts` and DNS, without NSS modules (LDAP or SSSD accounts, mDNS, ...).
+On Windows, extract the zip and run `ssh-config-compact.exe` from PowerShell or Command Prompt.
+
+### From source
+
+Requires Rust 1.88 or later.
+
+```sh
+cargo install --git https://github.com/weongyo/ssh-config-compact --tag 1.0.0 --locked
+# or, in a checkout of this repository
 cargo install --path . --locked
 ```
 
@@ -113,8 +145,9 @@ Check results are written to the cache as soon as each host is done, so:
 - Of the reused results, `--apply` rechecks **only the removal candidates**, right before removing them, so that hosts that came back in the meantime are not deleted.
   To skip this recheck, pass `--no-recheck`.
 
-The cache is stored in `$XDG_CACHE_HOME/ssh-config-compact/` (default `~/.cache/ssh-config-compact/`) as one file per combination of config path and check options
-(`--attempts`, `--timeout`, `--jump-timeout`, `--skip-private`, `--via-proxyjump`), with permissions `0600`.
+The cache is stored in `$XDG_CACHE_HOME/ssh-config-compact/` (default `~/.cache/ssh-config-compact/`; on Windows `%LOCALAPPDATA%\ssh-config-compact\`)
+as one file per combination of config path and check options
+(`--attempts`, `--timeout`, `--jump-timeout`, `--skip-private`, `--via-proxyjump`), with permissions `0600` (on Windows, the private access list of `%LOCALAPPDATA%`).
 In the following cases, results are not reused and hosts are checked again:
 
 - The config file's contents changed (compared by SHA-256)
@@ -122,7 +155,7 @@ In the following cases, results are not reused and hosts are checked again:
 - `--rescan` is given
 
 `--keep` and `--jobs` do not affect the results, so the cache is reused even when they change.
-Changes to `Include`d files, `/etc/ssh/ssh_config`, or the DNS/network environment are not detected, so use `--rescan` after such changes.
+Changes to `Include`d files, the system config (`/etc/ssh/ssh_config`), or the DNS/network environment are not detected, so use `--rescan` after such changes.
 Applying removals changes the config contents, so that config's cache file is deleted.
 
 ## Decision criteria
@@ -147,7 +180,8 @@ Applying removals changes the config contents, so that config's cache file is de
   - Failure to connect or authenticate to the jump host, refused forwarding (`administratively prohibited`), and failure of an intermediate hop in a multi-hop chain are treated as undecidable, so the host is kept.
   - The host counts as failed only when, after authenticating to the jump host, the connection to the target is refused or does not open within `--jump-timeout` (default 5 seconds, including the login).
   - Combined with `--skip-private`, a ProxyJump host is skipped if its `HostName` (an IP, or the result of a local lookup) is an internal address.
-    The local lookup uses the system resolver (`getaddrinfo`), so it follows `/etc/hosts` and the nsswitch configuration.
+    The local lookup uses the system resolver (`getaddrinfo`), so it follows `/etc/hosts` and the nsswitch configuration
+    (on Windows, the `hosts` file and the DNS client settings).
     If the local DNS lookup fails (e.g., a name that exists only in the jump host's DNS), the check goes ahead through the jump host anyway.
     The jump host resolves the name for the actual connection, so the local lookup result is used only to decide whether to skip the host.
   - With `--no-via-proxyjump`, ProxyJump hosts are kept without being checked.
@@ -161,10 +195,11 @@ A failed connection alone does not prove that a host is stale or permanently dec
 Review the candidate list with your current network situation in mind (VPN, corporate network, server maintenance, etc.) before approving the removal.
 Only an open TCP port is confirmed; the tool does not verify that an SSH service is actually running or that you can log in.
 
-Like OpenSSH, the default path is based on the current user's home directory as registered in the OS.
-To check a different file, specify its path with `--config` instead of changing the `HOME` environment variable.
-With the default config path, the system config is also read, as with plain `ssh`.
-With `--config`, as with `ssh -F`, `/etc/ssh/ssh_config` is not read automatically.
+Like OpenSSH, the default path is based on the current user's home directory as registered in the OS
+(on Windows, the account's profile directory, as Win32-OpenSSH uses it: usually `C:\Users\<name>\.ssh\config`).
+To check a different file, specify its path with `--config` instead of changing the `HOME` (or `USERPROFILE`) environment variable.
+With the default config path, the system config (`/etc/ssh/ssh_config`, or `%ProgramData%\ssh\ssh_config` on Windows) is also read, as with plain `ssh`.
+With `--config`, as with `ssh -F`, the system config is not read automatically.
 `ssh -G` evaluates the OpenSSH configuration, so `Match exec` commands in the config may be executed.
 `--timeout` applies to config evaluation as well, and remote connections are attempted only by the TCP check.
 
@@ -272,11 +307,12 @@ If no formatting option is given, only the existing cleanup and merge behavior r
 ## Backups and saving
 
 Once you approve, a backup named `config.bak.<time(ns)>.<PID>.<seq>` is first created next to the original,
-containing the original bytes exactly and synced to disk. The backup gets permissions `0600`, and existing backups are never overwritten.
+containing the original bytes exactly and synced to disk. The backup gets permissions `0600` (on Windows, the original's access control list),
+and existing backups are never overwritten.
 If the backup fails, the config is not changed. If there are no blocks to remove or you cancel, no backup is created either.
 
 The result is written to a temporary file in the same directory, which then atomically replaces the original.
-The existing file's permissions and owner are kept, and the indentation, line breaks, and content of the remaining settings are preserved exactly.
+The existing file's permissions (on Windows, its access control list) and owner are kept, and the indentation, line breaks, and content of the remaining settings are preserved exactly.
 Comments inside a removed block are removed with it; blank lines and comments at the end of the block are kept.
 Only when `--format` or `--format-only` is given is whitespace (and, with `--sort`, the order of settings) rewritten by the formatting rules above.
 
@@ -291,6 +327,11 @@ To restore, use the backup path that was printed:
 cp "$HOME/.ssh/config.bak.<time>.<PID>.<seq>" "$HOME/.ssh/config"
 ```
 
+```powershell
+# Windows (PowerShell)
+Copy-Item "$HOME\.ssh\config.bak.<time>.<PID>.<seq>" "$HOME\.ssh\config"
+```
+
 ## Development and verification
 
 ```sh
@@ -300,3 +341,12 @@ cargo test --all-targets
 ```
 
 The tests use temporary configs and local TCP sockets, and never modify your real `~/.ssh/config`.
+CI runs them on Linux, macOS, and Windows.
+
+## Releasing
+
+1. Set the new `version` in `Cargo.toml`, run `cargo check` to update `Cargo.lock`, and add a section for the version to `CHANGELOG.md`.
+2. Commit, then push a tag named after the version: `git tag -a 1.0.1 -m 1.0.1 && git push origin 1.0.1`.
+
+The release workflow then runs the tests, builds the archives for every platform listed above,
+and publishes them with `SHA256SUMS` as a GitHub release, using the `CHANGELOG.md` section as the release notes.
