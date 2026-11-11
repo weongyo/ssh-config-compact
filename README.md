@@ -341,7 +341,8 @@ cargo test --all-targets
 ```
 
 The tests use temporary configs and local TCP sockets, and never modify your real `~/.ssh/config`.
-CI runs them on Linux, macOS, and Windows.
+CI runs them on every GitHub-hosted runner image: Ubuntu 22.04, 24.04, and 26.04, Windows Server 2022 and 2025,
+Windows 11, and macOS 15 and 26, on both x64 and ARM64.
 
 ## Releasing
 

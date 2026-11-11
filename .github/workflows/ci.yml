@@ -18,7 +18,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Every standard GitHub-hosted runner image, free for public
+        # repositories: each OS version on x64 and ARM64. Each comes with a
+        # different OpenSSH, whose `ssh -G` the tool relies on. Labels that
+        # differ only in their Visual Studio or Xcode version are left out.
+        os:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - ubuntu-26.04
+          - ubuntu-22.04-arm
+          - ubuntu-24.04-arm
+          - ubuntu-26.04-arm
+          - windows-2022
+          - windows-2025
+          - windows-11-arm
+          - macos-15-intel
+          - macos-26-intel
+          - macos-15
+          - macos-26
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
