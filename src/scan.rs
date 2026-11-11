@@ -1,8 +1,9 @@
+use crate::process::ProcessTree;
+use crate::storage::{include_arg, system_config_path};
 use anyhow::{Context, Result, bail};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -163,7 +164,7 @@ fn jump_config(options: &ScanOptions) -> Result<tempfile::NamedTempFile> {
         None => {
             // Mirror plain ssh: user config first, then the system config.
             includes.push(crate::storage::default_config_path()?);
-            includes.push(PathBuf::from("/etc/ssh/ssh_config"));
+            includes.push(system_config_path()?);
         }
     }
     let mut text = String::from(
@@ -171,11 +172,7 @@ fn jump_config(options: &ScanOptions) -> Result<tempfile::NamedTempFile> {
          Host *\n  ControlMaster no\n  ControlPath none\n  ControlPersist no\n",
     );
     for path in includes {
-        let path = path
-            .to_str()
-            .filter(|p| !p.contains(['"', '\n']))
-            .with_context(|| format!("unsupported config path {}", path.display()))?;
-        text.push_str(&format!("Include \"{path}\"\n"));
+        text.push_str(&format!("Include {}\n", include_arg(&path)?));
     }
     let mut file = tempfile::Builder::new()
         .prefix("ssh-config-compact-")
@@ -344,12 +341,11 @@ fn run_bounded(mut command: Command, timeout: Duration) -> Result<String> {
     // Files avoid pipe deadlocks and inherited pipes from Match exec children.
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
-    let mut child = command
+    command
         .stdin(Stdio::null())
         .stdout(stdout.try_clone()?)
-        .stderr(stderr.try_clone()?)
-        .process_group(0)
-        .spawn()
+        .stderr(stderr.try_clone()?);
+    let mut child = ProcessTree::spawn(&mut command)
         .context("could not start ssh; install the OpenSSH client")?;
     let deadline = Instant::now() + timeout;
     let outcome = loop {
@@ -362,11 +358,9 @@ fn run_bounded(mut command: Command, timeout: Duration) -> Result<String> {
     };
     if outcome.is_err() {
         // Stop descendants from a stalled Match exec as well as ssh itself.
-        // SAFETY: kill accepts this numeric process-group id and no pointers.
-        // The still-unreaped child owns this process-group id.
-        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+        child.kill();
     }
-    let _ = child.wait();
+    child.wait();
     let status = outcome?;
     if !status.success() {
         let error = read_output(&mut stderr)?;
@@ -416,7 +410,7 @@ fn resolve(hostname: &str, port: u16, deadline: Instant) -> Result<Vec<SocketAdd
     match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(Ok(addresses)) => Ok(addresses),
         Ok(Err(error)) => {
-            // EAI_AGAIN is surfaced as an ordinary io::Error on Unix.
+            // EAI_AGAIN (WSATRY_AGAIN on Windows) is an ordinary io::Error.
             let message = error.to_string();
             if message.to_ascii_lowercase().contains("temporary") {
                 return Err(Probe::Uncertain(format!(
@@ -576,12 +570,11 @@ fn split_hop(hop: &str) -> (String, Option<&str>) {
 fn run_jump(mut command: Command, timeout: Duration, hops: usize) -> Result<(String, bool, bool)> {
     let stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
-    let mut child = command
+    command
         .stdin(Stdio::null())
         .stdout(stdout.try_clone()?)
-        .stderr(stderr.try_clone()?)
-        .process_group(0)
-        .spawn()
+        .stderr(stderr.try_clone()?);
+    let mut child = ProcessTree::spawn(&mut command)
         .context("could not start ssh; install the OpenSSH client")?;
     let deadline = Instant::now() + timeout;
     let exited = loop {
@@ -600,9 +593,9 @@ fn run_jump(mut command: Command, timeout: Duration, hops: usize) -> Result<(Str
             None => break false,
         }
     };
-    // SAFETY: see run_bounded; the unreaped child owns this process group.
-    unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
-    let _ = child.wait();
+    // Also stops the ssh of earlier hops, which ssh started itself.
+    child.kill();
+    child.wait();
     let received = stdout.metadata()?.len() > 0;
     Ok((read_output(&mut stderr)?, received, exited))
 }
@@ -738,9 +731,13 @@ mod tests {
         let text = std::fs::read_to_string(file.path()).unwrap();
         let control = text.find("ControlMaster no").unwrap();
         assert!(text.contains("ControlPath none"), "{text}");
-        let include = text.find("Include \"/x/my config\"").unwrap();
+        let absolute = std::path::absolute("/x/my config").unwrap();
+        let include = format!("Include {}\n", include_arg(&absolute).unwrap());
+        #[cfg(unix)]
+        assert_eq!(include, "Include \"/x/my config\"\n");
+        let include = text.find(&include).unwrap();
         assert!(control < include, "{text}");
-        assert!(!text.contains("/etc/ssh/ssh_config"), "{text}");
+        assert_eq!(text.matches("Include ").count(), 1, "{text}");
     }
 
     #[test]
@@ -829,8 +826,15 @@ mod tests {
 
     #[test]
     fn kills_config_commands_that_exceed_the_deadline() {
+        // A shell that waits for a command it started, like a stalled Match exec.
+        #[cfg(unix)]
         let mut command = Command::new("sh");
+        #[cfg(unix)]
         command.args(["-c", "sleep 30"]);
+        #[cfg(windows)]
+        let mut command = Command::new("cmd");
+        #[cfg(windows)]
+        command.args(["/C", "ping -n 30 127.0.0.1 >NUL"]);
         let start = Instant::now();
         let error = run_bounded(command, Duration::from_millis(50)).unwrap_err();
         assert!(error.to_string().contains("timed out"));

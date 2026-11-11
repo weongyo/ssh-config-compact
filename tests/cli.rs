@@ -1,11 +1,14 @@
-#![cfg(unix)]
-
 use std::fs;
 use std::io::Write;
 use std::net::TcpListener;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+
+/// Seconds per probe. Windows retries a refused connection for about two
+/// seconds before reporting it.
+const TIMEOUT: &str = if cfg!(windows) { "5" } else { "1" };
 
 struct Fixture {
     dir: tempfile::TempDir,
@@ -28,6 +31,7 @@ impl Fixture {
             "# test config\nHost old old-alias\n  HostName 127.0.0.1\n  Port {closed_port}\n\n# keep live\nHost live\n  HostName 127.0.0.1\n  Port {live_port}\n\nHost live shared-dead\n  HostName 127.0.0.1\n  Port {closed_port}\n\nHost through-jump\n  HostName 127.0.0.1\n  Port {closed_port}\n  ProxyJump gateway.invalid\n\nHost *.internal !excluded\n  User tester\n\nMatch all\n  ServerAliveInterval 30\n"
         );
         fs::write(&path, &original).unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
         Self {
             dir,
@@ -42,7 +46,7 @@ impl Fixture {
         let mut child = Command::new(env!("CARGO_BIN_EXE_ssh-config-compact"))
             .arg("--config")
             .arg(&self.path)
-            .args(["--attempts", "1", "--timeout", "1", "--jobs", "2"])
+            .args(["--attempts", "1", "--timeout", TIMEOUT, "--jobs", "2"])
             // Keep result caches inside the fixture, never in the real ~/.cache.
             .env("XDG_CACHE_HOME", self.dir.path().join("cache"))
             .args(args)
@@ -149,8 +153,11 @@ fn confirmed_apply_removes_only_failed_blocks_after_exact_backup() {
     .replace("Host live shared-dead\n", "Host live\n");
     assert_eq!(after, expected);
     assert!(after.contains("Match all\n  ServerAliveInterval 30\n"));
-    assert_eq!(fs::metadata(&fixture.path).unwrap().mode() & 0o777, 0o640);
-    assert_eq!(fs::metadata(&backups[0]).unwrap().mode() & 0o777, 0o600);
+    #[cfg(unix)]
+    {
+        assert_eq!(fs::metadata(&fixture.path).unwrap().mode() & 0o777, 0o640);
+        assert_eq!(fs::metadata(&backups[0]).unwrap().mode() & 0o777, 0o600);
+    }
 }
 
 #[test]
@@ -342,6 +349,21 @@ fn alias_kept_in_one_block_is_not_removed_from_another() {
     );
 }
 
+/// The user ssh connects as when no configuration names one.
+fn default_ssh_user() -> String {
+    let output = Command::new("ssh")
+        .args(["-G", "-F", "none", "--", "example.invalid"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let output = String::from_utf8(output.stdout).unwrap();
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("user "))
+        .unwrap_or_else(|| panic!("{output}"))
+        .to_owned()
+}
+
 fn ssh_g(config: &std::path::Path, alias: &str) -> String {
     let output = Command::new("ssh")
         .arg("-G")
@@ -422,8 +444,7 @@ fn merge_simplifies_without_changing_any_ssh_settings() {
 #[test]
 fn merge_keeps_settings_that_only_restate_defaults() {
     let fixture = Fixture::new();
-    let me = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout).unwrap();
-    let me = me.trim();
+    let me = default_ssh_user();
     let port = fixture.live_port;
     // On this machine "User <me>" and "PubkeyAuthentication yes" change
     // nothing, but they would for another account or system config.
@@ -519,11 +540,14 @@ fn format_only_needs_no_ssh_and_backs_up_once() {
     assert!(after.contains("Host dead dead\n  HostName 127.0.0.1\n  Port 1\n"));
     assert!(after.contains("\n\nHost other\n  User tester\n"));
     assert_eq!(fs::read_to_string(&fixture.backups()[0]).unwrap(), original);
-    assert_eq!(fs::metadata(&fixture.path).unwrap().mode() & 0o777, 0o640);
-    assert_eq!(
-        fs::metadata(&fixture.backups()[0]).unwrap().mode() & 0o777,
-        0o600
-    );
+    #[cfg(unix)]
+    {
+        assert_eq!(fs::metadata(&fixture.path).unwrap().mode() & 0o777, 0o640);
+        assert_eq!(
+            fs::metadata(&fixture.backups()[0]).unwrap().mode() & 0o777,
+            0o600
+        );
+    }
     assert_eq!(fs::read_to_string(included).unwrap(), include_text);
     assert!(!marker.exists());
     assert!(!fixture.dir.path().join("cache").exists());

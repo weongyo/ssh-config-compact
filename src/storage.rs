@@ -1,81 +1,83 @@
 use anyhow::{Context, Result, bail};
-use std::ffi::{CStr, OsStr, OsString};
-use std::fs::{self, File, Metadata, OpenOptions};
+use std::ffi::OsString;
+use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+use unix as platform;
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows as platform;
+
+use platform::FileState;
 
 /// OpenSSH uses the OS account's home, not the HOME environment variable.
 /// Match it so the file we edit is the file evaluated by `ssh -G`.
 pub fn default_config_path() -> Result<PathBuf> {
-    let mut buffer_size = 4096;
-    loop {
-        let mut buffer = vec![0_u8; buffer_size];
-        let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
-        let mut result = std::ptr::null_mut();
-        // SAFETY: entry, result, and buffer are valid writable storage, and the
-        // supplied length is exactly the allocated buffer size.
-        let code = unsafe {
-            libc::getpwuid_r(
-                libc::getuid(),
-                entry.as_mut_ptr(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                &mut result,
-            )
-        };
-        if code == libc::ERANGE && buffer_size < 1024 * 1024 {
-            buffer_size *= 2;
-            continue;
-        }
-        if code != 0 {
-            return Err(std::io::Error::from_raw_os_error(code))
-                .context("cannot look up SSH home directory; use --config PATH");
-        }
-        if result.is_null() {
-            bail!("current OS account is missing; use --config PATH");
-        }
-        // SAFETY: a successful getpwuid_r with a non-null result initialized
-        // entry. Its string fields remain valid while buffer is alive.
-        let entry = unsafe { entry.assume_init() };
-        if entry.pw_dir.is_null() {
-            bail!("current OS account has no home directory; use --config PATH");
-        }
-        // SAFETY: pw_dir is the NUL-terminated string returned by getpwuid_r.
-        let home = unsafe { CStr::from_ptr(entry.pw_dir) };
-        let home = PathBuf::from(OsStr::from_bytes(home.to_bytes()));
-        if !home.is_absolute() {
-            bail!("SSH home directory is not absolute; use --config PATH");
-        }
-        return Ok(home.join(".ssh/config"));
+    let home = platform::home_dir()?;
+    if !home.is_absolute() {
+        bail!("SSH home directory is not absolute; use --config PATH");
     }
+    Ok(home.join(".ssh").join("config"))
+}
+
+/// The system-wide client configuration, which plain `ssh` reads after the
+/// user's own: `/etc/ssh/ssh_config`, or `%ProgramData%\ssh\ssh_config` with
+/// Win32-OpenSSH.
+pub fn system_config_path() -> Result<PathBuf> {
+    platform::system_config_path()
+}
+
+/// `path` quoted as the argument of an ssh_config `Include` line.
+pub fn include_arg(path: &Path) -> Result<String> {
+    let text = path
+        .to_str()
+        .filter(|p| !p.contains(['"', '\n', '\r']))
+        .with_context(|| format!("unsupported config path {}", path.display()))?;
+    // ssh_config reads `\` as an escape character, and Win32-OpenSSH accepts
+    // `/` as a path separator.
+    let text = if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text.to_owned()
+    };
+    Ok(format!("\"{text}\""))
+}
+
+/// `fs::canonicalize`, but on Windows without the `\\?\` prefix whenever the
+/// familiar `C:\...` form names the same file.
+fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+    fs::canonicalize(path).map(platform::simplify)
 }
 
 pub struct Snapshot {
     requested_path: PathBuf,
     canonical_path: PathBuf,
     original: Vec<u8>,
-    metadata: Metadata,
+    state: FileState,
 }
 
 impl Snapshot {
     pub fn load(path: &Path) -> Result<Self> {
-        let canonical_path = fs::canonicalize(path)
+        let canonical_path = canonicalize(path)
             .with_context(|| format!("cannot open SSH config {}", path.display()))?;
         let mut file = File::open(&canonical_path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
+        if !file.metadata()?.is_file() {
             bail!("SSH config must be a regular file");
         }
+        let state = FileState::of(&file)?;
         let mut original = Vec::new();
         file.read_to_end(&mut original)?;
         Ok(Self {
             requested_path: path.to_owned(),
             canonical_path,
             original,
-            metadata,
+            state,
         })
     }
 
@@ -92,18 +94,11 @@ impl Snapshot {
     }
 
     fn ensure_unchanged(&self) -> Result<()> {
-        if fs::canonicalize(&self.requested_path)? != self.canonical_path {
+        if canonicalize(&self.requested_path)? != self.canonical_path {
             bail!("config symlink changed during the scan; refusing to overwrite it");
         }
         let mut file = File::open(&self.canonical_path)?;
-        let current = file.metadata()?;
-        if current.dev() != self.metadata.dev()
-            || current.ino() != self.metadata.ino()
-            || current.mode() != self.metadata.mode()
-            || current.uid() != self.metadata.uid()
-            || current.gid() != self.metadata.gid()
-            || current.nlink() != self.metadata.nlink()
-        {
+        if FileState::of(&file)? != self.state {
             bail!("config metadata changed during the scan; refusing to overwrite it");
         }
         let mut contents = Vec::new();
@@ -117,7 +112,7 @@ impl Snapshot {
     /// Call only after the user has reviewed and confirmed the exact removals.
     pub fn apply(&self, replacement: &str) -> Result<PathBuf> {
         self.ensure_unchanged()?;
-        if self.metadata.nlink() != 1 {
+        if self.state.links() != 1 {
             bail!("config has multiple hard links; refusing to replace it");
         }
         let parent = self
@@ -127,16 +122,10 @@ impl Snapshot {
         let mut temporary = tempfile::Builder::new()
             .prefix(".ssh-config-compact-")
             .tempfile_in(parent)?;
-        let temporary_metadata = temporary.as_file().metadata()?;
-        if temporary_metadata.uid() != self.metadata.uid()
-            || temporary_metadata.gid() != self.metadata.gid()
-        {
-            bail!("cannot preserve config ownership; refusing to replace it");
-        }
+        // Same owner and permissions as the original, or refuse.
+        self.state
+            .preserve_on(temporary.as_file(), temporary.path())?;
         temporary.write_all(replacement.as_bytes())?;
-        temporary
-            .as_file()
-            .set_permissions(fs::Permissions::from_mode(self.metadata.mode()))?;
         temporary.as_file().sync_all()?;
 
         self.ensure_unchanged()?;
@@ -145,13 +134,13 @@ impl Snapshot {
             backup.write_all(&self.original)?;
             backup.sync_all()?;
             // Persist the backup directory entry before replacing the config.
-            File::open(parent)?.sync_all()?;
+            platform::sync_dir(parent)?;
             self.ensure_unchanged()?;
             temporary
                 .persist(&self.canonical_path)
                 .map_err(|error| error.error)
                 .context("could not atomically replace SSH config")?;
-            File::open(parent)?.sync_all()?;
+            platform::sync_dir(parent)?;
             Ok(())
         };
         commit().with_context(|| format!("backup path: {}", backup_path.display()))?;
@@ -171,12 +160,7 @@ impl Snapshot {
                 std::process::id()
             ));
             let path = self.canonical_path.with_file_name(name);
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-            {
+            match self.state.create_backup(&path) {
                 Ok(file) => return Ok((path, file)),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
@@ -191,10 +175,11 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
 
+    #[cfg(unix)]
     #[test]
     fn backs_up_exact_bytes_preserves_mode_and_follows_symlink() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("actual-config");
         let link = dir.path().join("config");
@@ -209,6 +194,86 @@ mod tests {
         assert_eq!(fs::metadata(&target).unwrap().mode() & 0o777, 0o640);
         assert_eq!(fs::read_to_string(&link).unwrap(), "# original\r\n");
         assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+    }
+
+    /// Run `icacls path args...`.
+    #[cfg(windows)]
+    fn icacls(path: &Path, args: &[&str]) {
+        let output = std::process::Command::new("icacls")
+            .arg(path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "icacls {args:?}: {output:?}");
+    }
+
+    /// The access control list as `icacls` lists it, without the file name.
+    #[cfg(windows)]
+    fn acl(path: &Path) -> String {
+        let output = std::process::Command::new("icacls")
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let listing = String::from_utf8_lossy(&output.stdout);
+        let listing = listing.split("\r\n\r\n").next().unwrap();
+        listing
+            .strip_prefix(&*path.to_string_lossy())
+            .unwrap_or_else(|| panic!("{listing}"))
+            .lines()
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn backs_up_exact_bytes_and_preserves_the_access_control_list() {
+        let user = format!(
+            "{}\\{}",
+            std::env::var("USERDOMAIN").unwrap(),
+            std::env::var("USERNAME").unwrap()
+        );
+        for protect in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            // Like a profile directory: entries that new files inherit, for
+            // SYSTEM, Administrators, and the user.
+            icacls(
+                dir.path(),
+                &[
+                    "/grant:r",
+                    "*S-1-5-18:(OI)(CI)(F)",
+                    "*S-1-5-32-544:(OI)(CI)(F)",
+                    &format!("{user}:(OI)(CI)(F)"),
+                ],
+            );
+            icacls(dir.path(), &["/inheritance:r"]);
+            let path = dir.path().join("config");
+            let original = "# original\r\nHost old\r\n  Port 22\r\n";
+            fs::write(&path, original).unwrap();
+            if protect {
+                // Like a config fixed for Win32-OpenSSH's permission check:
+                // no longer inheriting, and without the Administrators entry,
+                // which inheriting would bring back.
+                icacls(&path, &["/inheritance:d"]);
+                icacls(&path, &["/remove:g", "*S-1-5-32-544"]);
+            } else {
+                // An explicit entry next to the inherited ones, neither of
+                // which may be lost or duplicated.
+                icacls(&path, &["/grant", "*S-1-5-32-545:(R)"]);
+            }
+            let expected = acl(&path);
+            assert_eq!(expected.contains("(I)"), !protect, "{expected}");
+            assert_eq!(expected.contains("Administrators"), !protect, "{expected}");
+            let snapshot = Snapshot::load(&path).unwrap();
+            let backup = snapshot.apply("# original\r\n").unwrap();
+            assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+            assert_eq!(fs::read_to_string(&path).unwrap(), "# original\r\n");
+            assert_eq!(acl(&path), expected);
+            assert_eq!(acl(&backup), expected);
+            // Printed paths keep the familiar form, without a `\\?\` prefix.
+            assert!(!backup.to_string_lossy().starts_with(r"\\?\"), "{backup:?}");
+        }
     }
 
     #[test]
@@ -233,7 +298,8 @@ mod tests {
     fn backup_creation_failure_leaves_the_original_untouched() {
         let dir = tempfile::tempdir().unwrap();
         // This is a valid config filename, but adding the backup suffix exceeds
-        // NAME_MAX. The replacement tempfile can still be created normally.
+        // the 255-unit name limit. The replacement tempfile can still be
+        // created normally.
         let path = dir.path().join("c".repeat(240));
         fs::write(&path, "Host old\n").unwrap();
         let snapshot = Snapshot::load(&path).unwrap();
@@ -248,8 +314,10 @@ mod tests {
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn refuses_retargeted_symlinks_and_hard_links() {
+    fn refuses_retargeted_symlinks() {
+        use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first");
         let second = dir.path().join("second");
@@ -261,6 +329,15 @@ mod tests {
         fs::remove_file(&link).unwrap();
         symlink(&second, &link).unwrap();
         assert!(snapshot.apply("").is_err());
+        assert_eq!(fs::read_to_string(&first).unwrap(), "Host old\n");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "Host other\n");
+    }
+
+    #[test]
+    fn refuses_hard_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        fs::write(&first, "Host old\n").unwrap();
         fs::hard_link(&first, dir.path().join("hardlink")).unwrap();
         let snapshot = Snapshot::load(&first).unwrap();
         assert!(
@@ -270,5 +347,20 @@ mod tests {
                 .to_string()
                 .contains("hard links")
         );
+    }
+
+    #[test]
+    fn quotes_include_paths() {
+        assert_eq!(
+            include_arg(Path::new("/x/my config")).unwrap(),
+            "\"/x/my config\""
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            include_arg(Path::new(r"C:\Users\me\.ssh\config")).unwrap(),
+            "\"C:/Users/me/.ssh/config\""
+        );
+        assert!(include_arg(Path::new("/x/\"quoted\"")).is_err());
+        assert!(include_arg(Path::new("/x/new\nline")).is_err());
     }
 }

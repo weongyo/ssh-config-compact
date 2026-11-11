@@ -14,7 +14,6 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -132,8 +131,11 @@ impl ResultCache {
 
     /// The config was rewritten; these results no longer describe it.
     pub fn remove(self) -> Result<()> {
-        fs::remove_file(&self.path)
-            .with_context(|| format!("cannot remove result cache {}", self.path.display()))
+        let Self { path, file, .. } = self;
+        // Close it first: Windows may refuse to delete an open file.
+        drop(file);
+        fs::remove_file(&path)
+            .with_context(|| format!("cannot remove result cache {}", path.display()))
     }
 }
 
@@ -184,17 +186,29 @@ fn write_entry(out: &mut impl Write, result: &HostResult, checked_at: SystemTime
 }
 
 fn cache_dir() -> Result<PathBuf> {
-    let base = match std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(".cache"),
-    };
-    let dir = base.join("ssh-config-compact");
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
+    let dir = cache_base()?.join("ssh-config-compact");
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
         .create(&dir)
         .with_context(|| format!("cannot create cache directory {}", dir.display()))?;
     Ok(dir)
+}
+
+/// `$XDG_CACHE_HOME` if set, otherwise `~/.cache`, or `%LOCALAPPDATA%` on
+/// Windows (only reachable by the account itself).
+fn cache_base() -> Result<PathBuf> {
+    let var = |name| std::env::var_os(name).filter(|value| !value.is_empty());
+    if let Some(dir) = var("XDG_CACHE_HOME") {
+        return Ok(PathBuf::from(dir));
+    }
+    if cfg!(windows) {
+        let dir = var("LOCALAPPDATA").context("LOCALAPPDATA is not set")?;
+        return Ok(PathBuf::from(dir));
+    }
+    Ok(PathBuf::from(var("HOME").context("HOME is not set")?).join(".cache"))
 }
 
 fn hex(bytes: &[u8]) -> String {

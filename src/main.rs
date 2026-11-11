@@ -1,6 +1,3 @@
-#[cfg(not(unix))]
-compile_error!("ssh-config-compact currently supports Unix (Linux and macOS)");
-
 use anyhow::Result;
 use clap::{ArgGroup, Parser};
 use ssh_config_compact::cache::{ResultCache, ScanKey};
@@ -694,6 +691,9 @@ fn brief_reason(reason: &str) -> String {
             "nodename nor servname",
             "no address associated",
             "not known",
+            // Windows: WSAHOST_NOT_FOUND and WSANO_DATA
+            "no such host is known",
+            "no data of the requested type",
         ]
         .iter()
         .any(|s| lower.contains(s))
@@ -704,11 +704,18 @@ fn brief_reason(reason: &str) -> String {
         }
     } else if lower.contains("refused") {
         "connection refused (port closed)"
-    } else if lower.contains("timed out") {
+    } else if lower.contains("timed out") || lower.contains("did not properly respond") {
         "connection timed out (no response)"
-    } else if lower.contains("no route to host") || lower.contains("host is unreachable") {
+    } else if [
+        "no route to host",
+        "host is unreachable",
+        "unreachable host",
+    ]
+    .iter()
+    .any(|s| lower.contains(s))
+    {
         "no route to host"
-    } else if lower.contains("network is unreachable") {
+    } else if lower.contains("network is unreachable") || lower.contains("unreachable network") {
         "network unreachable"
     } else {
         return single_line(reason);
@@ -742,6 +749,27 @@ mod tests {
             (
                 "1.2.3.4:22: No route to host (os error 113)",
                 "no route to host",
+            ),
+            // Windows wording of the same failures.
+            (
+                "DNS lookup failed: No such host is known. (os error 11001)",
+                "DNS name not found",
+            ),
+            (
+                "1.2.3.4:22: No connection could be made because the target machine actively refused it. (os error 10061)",
+                "connection refused (port closed)",
+            ),
+            (
+                "1.2.3.4:22: A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond. (os error 10060)",
+                "connection timed out (no response)",
+            ),
+            (
+                "1.2.3.4:22: A socket operation was attempted to an unreachable host. (os error 10065)",
+                "no route to host",
+            ),
+            (
+                "1.2.3.4:22: A socket operation was attempted to an unreachable network. (os error 10051)",
+                "network unreachable",
             ),
             ("something odd", "something odd"),
         ] {

@@ -18,6 +18,7 @@
 
 use crate::config::{Config, Directive, literal_alias};
 use crate::scan::ssh_g;
+use crate::storage::{include_arg, system_config_path};
 use anyhow::{Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -423,16 +424,27 @@ fn normalize(line: &str) -> String {
 struct Evaluator<'a> {
     dir: tempfile::TempDir,
     options: &'a MergeOptions,
+    /// `Include` line for the system config, when plain ssh would read it.
+    system_include: Option<String>,
     next: AtomicUsize,
 }
 
 impl<'a> Evaluator<'a> {
     fn new(options: &'a MergeOptions) -> Result<Self> {
+        let system_include = if options.system_config {
+            Some(format!(
+                "Include {}\n",
+                include_arg(&system_config_path()?)?
+            ))
+        } else {
+            None
+        };
         Ok(Self {
             dir: tempfile::Builder::new()
                 .prefix("ssh-config-compact-merge-")
                 .tempdir()?,
             options,
+            system_include,
             next: AtomicUsize::new(0),
         })
     }
@@ -448,20 +460,16 @@ impl<'a> Evaluator<'a> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let candidate = self.dir.path().join(format!("config-{id}"));
         fs::write(&candidate, text)?;
-        let entry: PathBuf = if self.options.system_config || !appended.is_empty() {
+        let entry: PathBuf = if self.system_include.is_some() || !appended.is_empty() {
             let wrapper = self.dir.path().join(format!("wrapper-{id}"));
-            let path = candidate.to_string_lossy();
-            if path.contains('"') {
-                bail!("unsupported temporary path {path}");
-            }
-            let mut content = format!("Include \"{path}\"\n");
+            let mut content = format!("Include {}\n", include_arg(&candidate)?);
             // Stands in for a different system config, so it goes before
             // this machine's one: a line kept only because this system config
             // happens to repeat it must not look redundant.
             content.push_str(appended);
-            if self.options.system_config {
+            if let Some(system_include) = &self.system_include {
                 // Plain ssh reads the system config after the user config.
-                content.push_str("Include /etc/ssh/ssh_config\n");
+                content.push_str(system_include);
             }
             fs::write(&wrapper, content)?;
             wrapper
@@ -489,13 +497,19 @@ impl<'a> Evaluator<'a> {
 /// `ssh -G` output, or the error, with the temporary paths masked so that
 /// two candidates can be compared.
 fn describe(entry: &Path, candidate: &Path, alias: &str, timeout: Duration) -> String {
-    let output = match ssh_g(entry, alias, timeout) {
+    let mut output = match ssh_g(entry, alias, timeout) {
         Ok(output) => output,
         Err(error) => format!("error: {error:#}"),
     };
+    for path in [entry, candidate] {
+        let path = path.to_string_lossy();
+        output = output.replace(&*path, "<config>");
+        if cfg!(windows) {
+            // As written in the Include lines (see include_arg).
+            output = output.replace(&path.replace('\\', "/"), "<config>");
+        }
+    }
     output
-        .replace(&*entry.to_string_lossy(), "<config>")
-        .replace(&*candidate.to_string_lossy(), "<config>")
 }
 
 #[cfg(test)]
